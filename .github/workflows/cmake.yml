@@ -1,3 +1,4 @@
+---
 name: CMake
 
 on:
@@ -5,6 +6,7 @@ on:
     branches: ["main"]
   pull_request:
     branches: ["main"]
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -14,26 +16,47 @@ jobs:
     strategy:
       matrix:
         # Customize the CMake build type here (Release, Debug, RelWithDebInfo, etc.)
-        build: [Release, Debug]
-        os: [ubuntu-latest, windows-latest]
+        build:
+          - {
+            type: Release,
+            libcurl: 'ON'
+          }
+          - {
+            type: Release,
+            libcurl: 'OFF'
+          }
+          - {
+            type: Debug,
+            libcurl: 'ON'
+          }
+        config:
+          - {
+            os: windows-latest,
+            osfamily: win
+          }
+          - {
+            os: ubuntu-latest,
+            osfamily: linux
+          }
+
     # The CMake configure and build commands are platform agnostic and should work equally well on Windows or Mac.
     # You can convert this to a matrix build if you need cross-platform coverage.
     # See: https://docs.github.com/en/free-pro-team@latest/actions/learn-github-actions/managing-complex-workflows#using-a-build-matrix
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.config.os }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v3
 
       - name: Install dependencies (Windows)
-        if: ${{ (matrix.OS == 'windows-latest') }}
+        if: ${{ (matrix.config.os == 'windows-latest') }}
         # on Windows, we rely on vcpkg to pull in dependencies
         shell: bash
         run: |
           vcpkg install rapidjson 'curl[ssl]' --triplet x64-windows
 
       - name: Install dependencies (Linux)
-        if: ${{ (matrix.OS == 'ubuntu-latest') }}
+        if: ${{ (matrix.config.os == 'ubuntu-latest') }}
         # on Linux, we use apt to get our dependencies
         shell: bash
         run: |
@@ -44,51 +67,74 @@ jobs:
           sudo apt-get install libssl-dev -y
 
       - name: Configure CMake (Windows)
-        if: ${{ (matrix.OS == 'windows-latest') }}
+        if: ${{ (matrix.config.os == 'windows-latest') }}
         shell: bash
         run: |
           # Configure CMake in a 'build' subdirectory. `CMAKE_BUILD_TYPE` is only required if you are using a single-configuration generator such as make.
           # See https://cmake.org/cmake/help/latest/variable/CMAKE_BUILD_TYPE.html?highlight=cmake_build_type
           # on Windows, we need to point CMake to the vcpkg-toolchain-file
-          cmake -B "${{github.workspace}}/build" -DCMAKE_BUILD_TYPE=${{matrix.build}} -DLIBCZI_BUILD_CZICMD=ON -DLIBCZI_BUILD_CURL_BASED_STREAM=ON -DLIBCZI_BUILD_PREFER_EXTERNALPACKAGE_LIBCURL=ON -DCMAKE_TOOLCHAIN_FILE="${VCPKG_INSTALLATION_ROOT}/scripts/buildsystems/vcpkg.cmake"
+          cmake -B "${{github.workspace}}/build" -DCMAKE_BUILD_TYPE=${{matrix.build.type}} -DLIBCZI_BUILD_CZICMD=ON -DLIBCZI_BUILD_CURL_BASED_STREAM=${{matrix.build.libcurl}} -DLIBCZI_BUILD_PREFER_EXTERNALPACKAGE_LIBCURL=ON -DCMAKE_TOOLCHAIN_FILE="${VCPKG_INSTALLATION_ROOT}/scripts/buildsystems/vcpkg.cmake"
 
       - name: Configure CMake (Linux)
-        if: ${{ (matrix.OS == 'ubuntu-latest') }}
+        if: ${{ (matrix.config.os == 'ubuntu-latest') }}
         shell: bash
         run: |
-          cmake -B "${{github.workspace}}/build" -DCMAKE_BUILD_TYPE=${{matrix.build}} -DLIBCZI_BUILD_CZICMD=ON -DLIBCZI_BUILD_CURL_BASED_STREAM=ON -DLIBCZI_BUILD_PREFER_EXTERNALPACKAGE_LIBCURL=OFF
+          cmake -B "${{github.workspace}}/build" -DCMAKE_BUILD_TYPE=${{matrix.build.type}} -DLIBCZI_BUILD_CZICMD=ON -DLIBCZI_BUILD_CURL_BASED_STREAM=${{matrix.build.libcurl}} -DLIBCZI_BUILD_PREFER_EXTERNALPACKAGE_LIBCURL=OFF
 
       - name: Build
         # Build your program with the given configuration
-        run: cmake --build ${{github.workspace}}/build --config ${{matrix.build}}
+        run: cmake --build "${{github.workspace}}/build" -j 3 --config ${{matrix.build.type}}
+
+      # gather the binaries
+      - name: Prepare CZIcmd artifact
+        if: ${{ matrix.build.type == 'Release' }}
+        shell: bash
+        run: |
+            mkdir ./publish
+            for f in "${{github.workspace}}/build/Src/CZICmd/CZIcmd" "${{github.workspace}}/build/Src/CZICmd/${{ matrix.build.type }}/"*
+            do
+              if [[ -f "$f" ]]
+              then
+                cp -v "$f" ./publish
+              fi
+            done
+            cp -v COPYING* THIRD* ./publish
+
+      # upload the build-results to artifacts-store
+      - name: Upload CZIcmd artifact
+        if: ${{ matrix.build.type == 'Release' }}
+        uses: actions/upload-artifact@v3
+        with:
+          name: CZIcmd-Streams${{ matrix.build.libcurl }}-${{ matrix.config.osfamily }}-x64
+          path: ./publish/
 
       - name: Test
-        working-directory: ${{github.workspace}}/build
+        working-directory: "${{github.workspace}}/build"
         # Execute tests defined by the CMake configuration.
         # See https://cmake.org/cmake/help/latest/manual/ctest.1.html for more detail
-        # Use debug flag to show all exeucted tests
-        run: ctest --debug -C ${{matrix.build}}
+        # Use debug flag to show all executed tests
+        run: ctest --debug -C ${{ matrix.build.type }}
 
       # Coverage collection based on https://about.codecov.io/blog/how-to-set-up-codecov-with-c-plus-plus-and-github-actions/
       - name: Prepare Coverage
-        if: ${{ (matrix.OS == 'windows-latest') && ( matrix.build == 'Debug') }}
+        if: ${{ (matrix.config.os == 'windows-latest') && ( matrix.build.type == 'Debug') }}
         run: |
           choco install OpenCppCoverage -y
           echo "C:\Program Files\OpenCppCoverage" >> "$env:GITHUB_PATH"
 
       - name: Get Coverage
-        if: ${{ (matrix.OS == 'windows-latest') && ( matrix.build == 'Debug') }}
-        working-directory: ${{github.workspace}}/build/Src/libCZI_UnitTests/${{matrix.build}}
+        if: ${{ (matrix.config.os == 'windows-latest') && ( matrix.build.type == 'Debug') }}
+        working-directory: ${{github.workspace}}/build/Src/libCZI_UnitTests/${{matrix.build.type}}
         shell: cmd
         run: OpenCppCoverage.exe --export_type cobertura:${{github.workspace}}\coverage.xml --config_file "${{github.workspace}}\opencppcoverage.txt" -- libCZI_UnitTests.exe
 
       - name: Upload Coverage
         uses: codecov/codecov-action@v3
-        if: ${{ (matrix.OS == 'windows-latest') && ( matrix.build == 'Debug') }}
+        if: ${{ (matrix.config.os == 'windows-latest') && ( matrix.build.type == 'Debug') && ( github.repository == 'ZEISS/libczi' ) }}
         with:
           files: ./coverage.xml
           fail_ci_if_error: true
           verbose: true
           # Only one flag to be safe with
           # https://docs.codecov.com/docs/flags#one-to-one-relationship-of-flags-to-uploads
-          flags: ${{matrix.OS}}
+          flags: ${{matrix.config.os}}
